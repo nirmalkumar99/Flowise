@@ -1,4 +1,5 @@
 import { Logger } from 'winston'
+import { URL } from 'url'
 import { v4 as uuidv4 } from 'uuid'
 import { Client } from 'langsmith'
 import CallbackHandler from 'langfuse-langchain'
@@ -25,14 +26,16 @@ import { AgentAction } from '@langchain/core/agents'
 import { LunaryHandler } from '@langchain/community/callbacks/handlers/lunary'
 
 import { getCredentialData, getCredentialParam, getEnvironmentVariable } from './utils'
+import { EvaluationRunTracer } from '../evaluation/EvaluationRunTracer'
+import { EvaluationRunTracerLlama } from '../evaluation/EvaluationRunTracerLlama'
 import { ICommonObject, IDatabaseEntity, INodeData, IServerSideEventStreamer } from './Interface'
 import { LangWatch, LangWatchSpan, LangWatchTrace, autoconvertTypedValues } from 'langwatch'
 import { DataSource } from 'typeorm'
 import { ChatGenerationChunk } from '@langchain/core/outputs'
-import { AIMessageChunk } from '@langchain/core/messages'
+import { AIMessageChunk, BaseMessageLike } from '@langchain/core/messages'
 import { Serialized } from '@langchain/core/load/serializable'
 
-interface AgentRun extends Run {
+export interface AgentRun extends Run {
     actions: AgentAction[]
 }
 
@@ -89,14 +92,27 @@ interface PhoenixTracerOptions {
     enableCallback?: boolean
 }
 
-function getPhoenixTracer(options: PhoenixTracerOptions): Tracer | undefined {
+export function getPhoenixTracer(options: PhoenixTracerOptions): Tracer | undefined {
     const SEMRESATTRS_PROJECT_NAME = 'openinference.project.name'
     try {
+        const parsedURL = new URL(options.baseUrl)
+        const baseEndpoint = `${parsedURL.protocol}//${parsedURL.host}`
+
+        // Remove trailing slashes
+        let path = parsedURL.pathname.replace(/\/$/, '')
+
+        // Remove any existing /v1/traces suffix
+        path = path.replace(/\/v1\/traces$/, '')
+
+        const exporterUrl = `${baseEndpoint}${path}/v1/traces`
+        const exporterHeaders = {
+            api_key: options.apiKey || '',
+            authorization: `Bearer ${options.apiKey || ''}`
+        }
+
         const traceExporter = new ProtoOTLPTraceExporter({
-            url: `${options.baseUrl}/v1/traces`,
-            headers: {
-                api_key: options.apiKey
-            }
+            url: exporterUrl,
+            headers: exporterHeaders
         })
         const tracerProvider = new NodeTracerProvider({
             resource: new Resource({
@@ -173,7 +189,7 @@ function tryGetJsonSpaces() {
     }
 }
 
-function tryJsonStringify(obj: unknown, fallback: string) {
+export function tryJsonStringify(obj: unknown, fallback: string) {
     try {
         return JSON.stringify(obj, null, tryGetJsonSpaces())
     } catch (err) {
@@ -181,7 +197,7 @@ function tryJsonStringify(obj: unknown, fallback: string) {
     }
 }
 
-function elapsed(run: Run): string {
+export function elapsed(run: Run): string {
     if (!run.end_time) return ''
     const elapsed = run.end_time - run.start_time
     if (elapsed < 1000) {
@@ -193,14 +209,16 @@ function elapsed(run: Run): string {
 export class ConsoleCallbackHandler extends BaseTracer {
     name = 'console_callback_handler' as const
     logger: Logger
+    orgId?: string
 
     protected persistRun(_run: Run) {
         return Promise.resolve()
     }
 
-    constructor(logger: Logger) {
+    constructor(logger: Logger, orgId?: string) {
         super()
         this.logger = logger
+        this.orgId = orgId
         if (getEnvironmentVariable('DEBUG') === 'true') {
             logger.level = getEnvironmentVariable('LOG_LEVEL') ?? 'info'
         }
@@ -235,57 +253,76 @@ export class ConsoleCallbackHandler extends BaseTracer {
     onChainStart(run: Run) {
         const crumbs = this.getBreadcrumbs(run)
 
-        this.logger.verbose(`[chain/start] [${crumbs}] Entering Chain run with input: ${tryJsonStringify(run.inputs, '[inputs]')}`)
+        this.logger.verbose(
+            `[${this.orgId}]: [chain/start] [${crumbs}] Entering Chain run with input: ${tryJsonStringify(run.inputs, '[inputs]')}`
+        )
     }
 
     onChainEnd(run: Run) {
         const crumbs = this.getBreadcrumbs(run)
         this.logger.verbose(
-            `[chain/end] [${crumbs}] [${elapsed(run)}] Exiting Chain run with output: ${tryJsonStringify(run.outputs, '[outputs]')}`
+            `[${this.orgId}]: [chain/end] [${crumbs}] [${elapsed(run)}] Exiting Chain run with output: ${tryJsonStringify(
+                run.outputs,
+                '[outputs]'
+            )}`
         )
     }
 
     onChainError(run: Run) {
         const crumbs = this.getBreadcrumbs(run)
         this.logger.verbose(
-            `[chain/error] [${crumbs}] [${elapsed(run)}] Chain run errored with error: ${tryJsonStringify(run.error, '[error]')}`
+            `[${this.orgId}]: [chain/error] [${crumbs}] [${elapsed(run)}] Chain run errored with error: ${tryJsonStringify(
+                run.error,
+                '[error]'
+            )}`
         )
     }
 
     onLLMStart(run: Run) {
         const crumbs = this.getBreadcrumbs(run)
         const inputs = 'prompts' in run.inputs ? { prompts: (run.inputs.prompts as string[]).map((p) => p.trim()) } : run.inputs
-        this.logger.verbose(`[llm/start] [${crumbs}] Entering LLM run with input: ${tryJsonStringify(inputs, '[inputs]')}`)
+        this.logger.verbose(`[${this.orgId}]: [llm/start] [${crumbs}] Entering LLM run with input: ${tryJsonStringify(inputs, '[inputs]')}`)
     }
 
     onLLMEnd(run: Run) {
         const crumbs = this.getBreadcrumbs(run)
         this.logger.verbose(
-            `[llm/end] [${crumbs}] [${elapsed(run)}] Exiting LLM run with output: ${tryJsonStringify(run.outputs, '[response]')}`
+            `[${this.orgId}]: [llm/end] [${crumbs}] [${elapsed(run)}] Exiting LLM run with output: ${tryJsonStringify(
+                run.outputs,
+                '[response]'
+            )}`
         )
     }
 
     onLLMError(run: Run) {
         const crumbs = this.getBreadcrumbs(run)
         this.logger.verbose(
-            `[llm/error] [${crumbs}] [${elapsed(run)}] LLM run errored with error: ${tryJsonStringify(run.error, '[error]')}`
+            `[${this.orgId}]: [llm/error] [${crumbs}] [${elapsed(run)}] LLM run errored with error: ${tryJsonStringify(
+                run.error,
+                '[error]'
+            )}`
         )
     }
 
     onToolStart(run: Run) {
         const crumbs = this.getBreadcrumbs(run)
-        this.logger.verbose(`[tool/start] [${crumbs}] Entering Tool run with input: "${run.inputs.input?.trim()}"`)
+        this.logger.verbose(`[${this.orgId}]: [tool/start] [${crumbs}] Entering Tool run with input: "${run.inputs.input?.trim()}"`)
     }
 
     onToolEnd(run: Run) {
         const crumbs = this.getBreadcrumbs(run)
-        this.logger.verbose(`[tool/end] [${crumbs}] [${elapsed(run)}] Exiting Tool run with output: "${run.outputs?.output?.trim()}"`)
+        this.logger.verbose(
+            `[${this.orgId}]: [tool/end] [${crumbs}] [${elapsed(run)}] Exiting Tool run with output: "${run.outputs?.output?.trim()}"`
+        )
     }
 
     onToolError(run: Run) {
         const crumbs = this.getBreadcrumbs(run)
         this.logger.verbose(
-            `[tool/error] [${crumbs}] [${elapsed(run)}] Tool run errored with error: ${tryJsonStringify(run.error, '[error]')}`
+            `[${this.orgId}]: [tool/error] [${crumbs}] [${elapsed(run)}] Tool run errored with error: ${tryJsonStringify(
+                run.error,
+                '[error]'
+            )}`
         )
     }
 
@@ -293,7 +330,7 @@ export class ConsoleCallbackHandler extends BaseTracer {
         const agentRun = run as AgentRun
         const crumbs = this.getBreadcrumbs(run)
         this.logger.verbose(
-            `[agent/action] [${crumbs}] Agent selected action: ${tryJsonStringify(
+            `[${this.orgId}]: [agent/action] [${crumbs}] Agent selected action: ${tryJsonStringify(
                 agentRun.actions[agentRun.actions.length - 1],
                 '[action]'
             )}`
@@ -396,6 +433,7 @@ export class CustomChainHandler extends BaseCallbackHandler {
     }
 }
 
+/*TODO - Add llamaIndex tracer to non evaluation runs*/
 class ExtendedLunaryHandler extends LunaryHandler {
     chatId: string
     appDataSource: DataSource
@@ -550,6 +588,13 @@ export const additionalCallbacks = async (nodeData: INodeData, options: ICommonO
                     const handler = new ExtendedLunaryHandler(lunaryFields)
 
                     callbacks.push(handler)
+                } else if (provider === 'evaluation') {
+                    if (options.llamaIndex) {
+                        new EvaluationRunTracerLlama(options.evaluationRunId)
+                    } else {
+                        const evaluationHandler = new EvaluationRunTracer(options.evaluationRunId)
+                        callbacks.push(evaluationHandler)
+                    }
                 } else if (provider === 'langWatch') {
                     const langWatchApiKey = getCredentialParam('langWatchApiKey', credentialData, nodeData)
                     const langWatchEndpoint = getCredentialParam('langWatchEndpoint', credentialData, nodeData)
@@ -560,6 +605,15 @@ export const additionalCallbacks = async (nodeData: INodeData, options: ICommonO
                     })
 
                     const trace = langwatch.getTrace()
+
+                    if (nodeData?.inputs?.analytics?.langWatch) {
+                        trace.update({
+                            metadata: {
+                                ...nodeData?.inputs?.analytics?.langWatch
+                            }
+                        })
+                    }
+
                     callbacks.push(trace.getLangChainCallback())
                 } else if (provider === 'arize') {
                     const arizeApiKey = getCredentialParam('arizeApiKey', credentialData, nodeData)
@@ -635,134 +689,215 @@ export const additionalCallbacks = async (nodeData: INodeData, options: ICommonO
 }
 
 export class AnalyticHandler {
-    nodeData: INodeData
-    options: ICommonObject = {}
-    handlers: ICommonObject = {}
+    private static instances: Map<string, AnalyticHandler> = new Map()
+    private nodeData: INodeData
+    private options: ICommonObject
+    private handlers: ICommonObject = {}
+    private initialized: boolean = false
+    private analyticsConfig: string | undefined
+    private chatId: string
+    private createdAt: number
 
-    constructor(nodeData: INodeData, options: ICommonObject) {
-        this.options = options
+    private constructor(nodeData: INodeData, options: ICommonObject) {
         this.nodeData = nodeData
-        this.init()
+        this.options = options
+        this.analyticsConfig = options.analytic
+        this.chatId = options.chatId
+        this.createdAt = Date.now()
+    }
+
+    static getInstance(nodeData: INodeData, options: ICommonObject): AnalyticHandler {
+        const chatId = options.chatId
+        if (!chatId) throw new Error('ChatId is required for analytics')
+
+        // Reset instance if analytics config changed for this chat
+        const instance = AnalyticHandler.instances.get(chatId)
+        if (instance?.analyticsConfig !== options.analytic) {
+            AnalyticHandler.resetInstance(chatId)
+        }
+
+        if (!AnalyticHandler.instances.get(chatId)) {
+            AnalyticHandler.instances.set(chatId, new AnalyticHandler(nodeData, options))
+        }
+        return AnalyticHandler.instances.get(chatId)!
+    }
+
+    static resetInstance(chatId: string): void {
+        AnalyticHandler.instances.delete(chatId)
+    }
+
+    // Keep this as backup for orphaned instances
+    static cleanup(maxAge: number = 3600000): void {
+        const now = Date.now()
+        for (const [chatId, instance] of AnalyticHandler.instances) {
+            if (now - instance.createdAt > maxAge) {
+                AnalyticHandler.resetInstance(chatId)
+            }
+        }
+    }
+
+    /**
+     * Helper method to end an OpenTelemetry span with output, token usage, and model name attributes.
+     * Used by arize, phoenix, and opik providers.
+     */
+    private _endOtelSpan(
+        providerName: string,
+        returnIds: ICommonObject,
+        outputText: string,
+        usageMetadata?: { input_tokens?: number; output_tokens?: number; total_tokens?: number },
+        modelName?: string
+    ): void {
+        const llmSpan: Span | undefined = this.handlers[providerName]?.llmSpan?.[returnIds[providerName]?.llmSpan]
+        if (llmSpan) {
+            llmSpan.setAttribute('output.value', JSON.stringify(outputText))
+            llmSpan.setAttribute('output.mime_type', 'application/json')
+            if (usageMetadata) {
+                if (usageMetadata.input_tokens !== undefined) {
+                    llmSpan.setAttribute('llm.token_count.prompt', usageMetadata.input_tokens)
+                }
+                if (usageMetadata.output_tokens !== undefined) {
+                    llmSpan.setAttribute('llm.token_count.completion', usageMetadata.output_tokens)
+                }
+                if (usageMetadata.total_tokens !== undefined) {
+                    llmSpan.setAttribute('llm.token_count.total', usageMetadata.total_tokens)
+                }
+            }
+            if (modelName) {
+                llmSpan.setAttribute('llm.model_name', modelName)
+            }
+            llmSpan.setStatus({ code: SpanStatusCode.OK })
+            llmSpan.end()
+        }
     }
 
     async init() {
+        if (this.initialized) return
+
         try {
             if (!this.options.analytic) return
 
             const analytic = JSON.parse(this.options.analytic)
-
             for (const provider in analytic) {
                 const providerStatus = analytic[provider].status as boolean
-
                 if (providerStatus) {
                     const credentialId = analytic[provider].credentialId as string
                     const credentialData = await getCredentialData(credentialId ?? '', this.options)
-                    if (provider === 'langSmith') {
-                        const langSmithProject = analytic[provider].projectName as string
-                        const langSmithApiKey = getCredentialParam('langSmithApiKey', credentialData, this.nodeData)
-                        const langSmithEndpoint = getCredentialParam('langSmithEndpoint', credentialData, this.nodeData)
-
-                        const client = new LangsmithClient({
-                            apiUrl: langSmithEndpoint ?? 'https://api.smith.langchain.com',
-                            apiKey: langSmithApiKey
-                        })
-
-                        this.handlers['langSmith'] = { client, langSmithProject }
-                    } else if (provider === 'langFuse') {
-                        const release = analytic[provider].release as string
-                        const langFuseSecretKey = getCredentialParam('langFuseSecretKey', credentialData, this.nodeData)
-                        const langFusePublicKey = getCredentialParam('langFusePublicKey', credentialData, this.nodeData)
-                        const langFuseEndpoint = getCredentialParam('langFuseEndpoint', credentialData, this.nodeData)
-
-                        const langfuse = new Langfuse({
-                            secretKey: langFuseSecretKey,
-                            publicKey: langFusePublicKey,
-                            baseUrl: langFuseEndpoint ?? 'https://cloud.langfuse.com',
-                            sdkIntegration: 'Flowise',
-                            release
-                        })
-                        this.handlers['langFuse'] = { client: langfuse }
-                    } else if (provider === 'lunary') {
-                        const lunaryPublicKey = getCredentialParam('lunaryAppId', credentialData, this.nodeData)
-                        const lunaryEndpoint = getCredentialParam('lunaryEndpoint', credentialData, this.nodeData)
-
-                        lunary.init({
-                            publicKey: lunaryPublicKey,
-                            apiUrl: lunaryEndpoint,
-                            runtime: 'flowise'
-                        })
-
-                        this.handlers['lunary'] = { client: lunary }
-                    } else if (provider === 'langWatch') {
-                        const langWatchApiKey = getCredentialParam('langWatchApiKey', credentialData, this.nodeData)
-                        const langWatchEndpoint = getCredentialParam('langWatchEndpoint', credentialData, this.nodeData)
-
-                        const langwatch = new LangWatch({
-                            apiKey: langWatchApiKey,
-                            endpoint: langWatchEndpoint
-                        })
-
-                        this.handlers['langWatch'] = { client: langwatch }
-                    } else if (provider === 'arize') {
-                        const arizeApiKey = getCredentialParam('arizeApiKey', credentialData, this.nodeData)
-                        const arizeSpaceId = getCredentialParam('arizeSpaceId', credentialData, this.nodeData)
-                        const arizeEndpoint = getCredentialParam('arizeEndpoint', credentialData, this.nodeData)
-                        const arizeProject = analytic[provider].projectName as string
-
-                        let arizeOptions: ArizeTracerOptions = {
-                            apiKey: arizeApiKey,
-                            spaceId: arizeSpaceId,
-                            baseUrl: arizeEndpoint ?? 'https://otlp.arize.com',
-                            projectName: arizeProject ?? 'default',
-                            sdkIntegration: 'Flowise',
-                            enableCallback: false
-                        }
-
-                        const arize: Tracer | undefined = getArizeTracer(arizeOptions)
-                        const rootSpan: Span | undefined = undefined
-
-                        this.handlers['arize'] = { client: arize, arizeProject, rootSpan }
-                    } else if (provider === 'phoenix') {
-                        const phoenixApiKey = getCredentialParam('phoenixApiKey', credentialData, this.nodeData)
-                        const phoenixEndpoint = getCredentialParam('phoenixEndpoint', credentialData, this.nodeData)
-                        const phoenixProject = analytic[provider].projectName as string
-
-                        let phoenixOptions: PhoenixTracerOptions = {
-                            apiKey: phoenixApiKey,
-                            baseUrl: phoenixEndpoint ?? 'https://app.phoenix.arize.com',
-                            projectName: phoenixProject ?? 'default',
-                            sdkIntegration: 'Flowise',
-                            enableCallback: false
-                        }
-
-                        const phoenix: Tracer | undefined = getPhoenixTracer(phoenixOptions)
-                        const rootSpan: Span | undefined = undefined
-
-                        this.handlers['phoenix'] = { client: phoenix, phoenixProject, rootSpan }
-                    } else if (provider === 'opik') {
-                        const opikApiKey = getCredentialParam('opikApiKey', credentialData, this.nodeData)
-                        const opikEndpoint = getCredentialParam('opikUrl', credentialData, this.nodeData)
-                        const opikWorkspace = getCredentialParam('opikWorkspace', credentialData, this.nodeData)
-                        const opikProject = analytic[provider].opikProjectName as string
-
-                        let opikOptions: OpikTracerOptions = {
-                            apiKey: opikApiKey,
-                            baseUrl: opikEndpoint ?? 'https://www.comet.com/opik/api',
-                            projectName: opikProject ?? 'default',
-                            workspace: opikWorkspace ?? 'default',
-                            sdkIntegration: 'Flowise',
-                            enableCallback: false
-                        }
-
-                        const opik: Tracer | undefined = getOpikTracer(opikOptions)
-                        const rootSpan: Span | undefined = undefined
-
-                        this.handlers['opik'] = { client: opik, opikProject, rootSpan }
-                    }
+                    await this.initializeProvider(provider, analytic[provider], credentialData)
                 }
             }
+            this.initialized = true
         } catch (e) {
             throw new Error(e)
+        }
+    }
+
+    // Add getter for handlers (useful for debugging)
+    getHandlers(): ICommonObject {
+        return this.handlers
+    }
+
+    async initializeProvider(provider: string, providerConfig: any, credentialData: any) {
+        if (provider === 'langSmith') {
+            const langSmithProject = providerConfig.projectName as string
+            const langSmithApiKey = getCredentialParam('langSmithApiKey', credentialData, this.nodeData)
+            const langSmithEndpoint = getCredentialParam('langSmithEndpoint', credentialData, this.nodeData)
+
+            const client = new LangsmithClient({
+                apiUrl: langSmithEndpoint ?? 'https://api.smith.langchain.com',
+                apiKey: langSmithApiKey
+            })
+
+            this.handlers['langSmith'] = { client, langSmithProject }
+        } else if (provider === 'langFuse') {
+            const release = providerConfig.release as string
+            const langFuseSecretKey = getCredentialParam('langFuseSecretKey', credentialData, this.nodeData)
+            const langFusePublicKey = getCredentialParam('langFusePublicKey', credentialData, this.nodeData)
+            const langFuseEndpoint = getCredentialParam('langFuseEndpoint', credentialData, this.nodeData)
+
+            const langfuse = new Langfuse({
+                secretKey: langFuseSecretKey,
+                publicKey: langFusePublicKey,
+                baseUrl: langFuseEndpoint ?? 'https://cloud.langfuse.com',
+                sdkIntegration: 'Flowise',
+                release
+            })
+            this.handlers['langFuse'] = { client: langfuse }
+        } else if (provider === 'lunary') {
+            const lunaryPublicKey = getCredentialParam('lunaryAppId', credentialData, this.nodeData)
+            const lunaryEndpoint = getCredentialParam('lunaryEndpoint', credentialData, this.nodeData)
+
+            lunary.init({
+                publicKey: lunaryPublicKey,
+                apiUrl: lunaryEndpoint,
+                runtime: 'flowise'
+            })
+
+            this.handlers['lunary'] = { client: lunary }
+        } else if (provider === 'langWatch') {
+            const langWatchApiKey = getCredentialParam('langWatchApiKey', credentialData, this.nodeData)
+            const langWatchEndpoint = getCredentialParam('langWatchEndpoint', credentialData, this.nodeData)
+
+            const langwatch = new LangWatch({
+                apiKey: langWatchApiKey,
+                endpoint: langWatchEndpoint
+            })
+
+            this.handlers['langWatch'] = { client: langwatch }
+        } else if (provider === 'arize') {
+            const arizeApiKey = getCredentialParam('arizeApiKey', credentialData, this.nodeData)
+            const arizeSpaceId = getCredentialParam('arizeSpaceId', credentialData, this.nodeData)
+            const arizeEndpoint = getCredentialParam('arizeEndpoint', credentialData, this.nodeData)
+            const arizeProject = providerConfig.projectName as string
+
+            let arizeOptions: ArizeTracerOptions = {
+                apiKey: arizeApiKey,
+                spaceId: arizeSpaceId,
+                baseUrl: arizeEndpoint ?? 'https://otlp.arize.com',
+                projectName: arizeProject ?? 'default',
+                sdkIntegration: 'Flowise',
+                enableCallback: false
+            }
+
+            const arize: Tracer | undefined = getArizeTracer(arizeOptions)
+            const rootSpan: Span | undefined = undefined
+
+            this.handlers['arize'] = { client: arize, arizeProject, rootSpan }
+        } else if (provider === 'phoenix') {
+            const phoenixApiKey = getCredentialParam('phoenixApiKey', credentialData, this.nodeData)
+            const phoenixEndpoint = getCredentialParam('phoenixEndpoint', credentialData, this.nodeData)
+            const phoenixProject = providerConfig.projectName as string
+
+            let phoenixOptions: PhoenixTracerOptions = {
+                apiKey: phoenixApiKey,
+                baseUrl: phoenixEndpoint ?? 'https://app.phoenix.arize.com',
+                projectName: phoenixProject ?? 'default',
+                sdkIntegration: 'Flowise',
+                enableCallback: false
+            }
+
+            const phoenix: Tracer | undefined = getPhoenixTracer(phoenixOptions)
+            const rootSpan: Span | undefined = undefined
+
+            this.handlers['phoenix'] = { client: phoenix, phoenixProject, rootSpan }
+        } else if (provider === 'opik') {
+            const opikApiKey = getCredentialParam('opikApiKey', credentialData, this.nodeData)
+            const opikEndpoint = getCredentialParam('opikUrl', credentialData, this.nodeData)
+            const opikWorkspace = getCredentialParam('opikWorkspace', credentialData, this.nodeData)
+            const opikProject = providerConfig.opikProjectName as string
+
+            let opikOptions: OpikTracerOptions = {
+                apiKey: opikApiKey,
+                baseUrl: opikEndpoint ?? 'https://www.comet.com/opik/api',
+                projectName: opikProject ?? 'default',
+                workspace: opikWorkspace ?? 'default',
+                sdkIntegration: 'Flowise',
+                enableCallback: false
+            }
+
+            const opik: Tracer | undefined = getOpikTracer(opikOptions)
+            const rootSpan: Span | undefined = undefined
+
+            this.handlers['opik'] = { client: opik, opikProject, rootSpan }
         }
     }
 
@@ -1077,6 +1212,11 @@ export class AnalyticHandler {
                 chainSpan.end()
             }
         }
+
+        if (shutdown) {
+            // Cleanup this instance when chain ends
+            AnalyticHandler.resetInstance(this.chatId)
+        }
     }
 
     async onChainError(returnIds: ICommonObject, error: string | object, shutdown = false) {
@@ -1155,27 +1295,38 @@ export class AnalyticHandler {
                 chainSpan.end()
             }
         }
+
+        if (shutdown) {
+            // Cleanup this instance when chain ends
+            AnalyticHandler.resetInstance(this.chatId)
+        }
     }
 
-    async onLLMStart(name: string, input: string, parentIds: ICommonObject) {
+    async onLLMStart(name: string, input: string | BaseMessageLike[], parentIds: ICommonObject) {
         const returnIds: ICommonObject = {
             langSmith: {},
             langFuse: {},
             lunary: {},
             langWatch: {},
             arize: {},
-            phoenix: {}
+            phoenix: {},
+            opik: {}
         }
 
         if (Object.prototype.hasOwnProperty.call(this.handlers, 'langSmith')) {
             const parentRun: RunTree | undefined = this.handlers['langSmith'].chainRun[parentIds['langSmith'].chainRun]
+
             if (parentRun) {
+                const inputs: any = {}
+                if (Array.isArray(input)) {
+                    inputs.messages = input
+                } else {
+                    inputs.prompts = [input]
+                }
                 const childLLMRun = await parentRun.createChild({
                     name,
                     run_type: 'llm',
-                    inputs: {
-                        prompts: [input]
-                    }
+                    inputs
                 })
                 await childLLMRun.postRun()
                 this.handlers['langSmith'].llmRun = { [childLLMRun.id]: childLLMRun }
@@ -1284,25 +1435,104 @@ export class AnalyticHandler {
         return returnIds
     }
 
-    async onLLMEnd(returnIds: ICommonObject, output: string) {
+    async onLLMEnd(
+        returnIds: ICommonObject,
+        output: string | ICommonObject,
+        { model, provider }: { model?: string; provider?: string } = {}
+    ) {
+        // Extract content, usage metadata, and model name from output
+        // Support both string (backward compatible) and structured object formats
+        let outputText: string
+        let usageMetadata: ICommonObject | undefined
+        let modelName = model
+
+        if (typeof output === 'string') {
+            outputText = output
+        } else {
+            // Extract text content
+            outputText = output.content ?? ''
+
+            // Extract usage metadata (supports both LangChain and OpenAI field names)
+            usageMetadata = output.usageMetadata ?? output.usage_metadata
+            if (usageMetadata) {
+                // Normalize field names for consistent access
+                usageMetadata = {
+                    input_tokens: usageMetadata.input_tokens ?? usageMetadata.prompt_tokens,
+                    output_tokens: usageMetadata.output_tokens ?? usageMetadata.completion_tokens,
+                    total_tokens: usageMetadata.total_tokens
+                }
+            }
+
+            // Extract model name from response metadata
+            const responseMetadata = output.responseMetadata ?? output.response_metadata
+            if (!model && responseMetadata) {
+                modelName = responseMetadata.model ?? responseMetadata.model_name ?? responseMetadata.modelId
+            }
+        }
+
         if (Object.prototype.hasOwnProperty.call(this.handlers, 'langSmith')) {
             const llmRun: RunTree | undefined = this.handlers['langSmith'].llmRun[returnIds['langSmith'].llmRun]
             if (llmRun) {
-                await llmRun.end({
-                    outputs: {
-                        generations: [output]
+                const outputs: ICommonObject = {
+                    generations: [outputText]
+                }
+                // Add usage_metadata and model info to run's extra.metadata for cost tracking
+                // LangSmith requires: usage_metadata (with input_tokens, output_tokens, total_tokens)
+                // and ls_model_name + ls_provider in metadata for automatic cost calculation
+                if (usageMetadata || modelName) {
+                    if (!llmRun.extra) {
+                        llmRun.extra = {}
                     }
+                    if (!llmRun.extra.metadata) {
+                        llmRun.extra.metadata = {}
+                    }
+                    if (usageMetadata) {
+                        llmRun.extra.metadata.usage_metadata = {
+                            input_tokens: usageMetadata.input_tokens,
+                            output_tokens: usageMetadata.output_tokens,
+                            total_tokens: usageMetadata.total_tokens
+                        }
+                    }
+                    if (modelName) {
+                        llmRun.extra.metadata.ls_model_name = modelName
+                    }
+                    if (provider) {
+                        let normalized = provider.toLowerCase()
+                        if (normalized.startsWith('chat')) normalized = normalized.slice(4)
+                        if (normalized.endsWith('chat')) normalized = normalized.slice(0, -4)
+                        if (normalized.includes('bedrock')) normalized = 'amazon_bedrock'
+                        llmRun.extra.metadata.ls_provider = normalized
+                    }
+                }
+                await llmRun.end({
+                    outputs
                 })
                 await llmRun.patchRun()
             }
         }
 
         if (Object.prototype.hasOwnProperty.call(this.handlers, 'langFuse')) {
-            const generation: LangfuseGenerationClient | undefined = this.handlers['langFuse'].generation[returnIds['langFuse'].generation]
+            const generation: LangfuseGenerationClient | undefined = this.handlers['langFuse'].generation[returnIds['langFuse']?.generation]
             if (generation) {
-                generation.end({
-                    output: output
-                })
+                const endPayload: ICommonObject = {
+                    output: outputText
+                }
+                // Add model name if available
+                if (modelName) {
+                    endPayload.model = modelName
+                }
+                // Add usage data if available (using Langfuse's OpenAIUsage format)
+                if (usageMetadata) {
+                    endPayload.usage = {
+                        promptTokens: usageMetadata.input_tokens,
+                        completionTokens: usageMetadata.output_tokens,
+                        totalTokens: usageMetadata.total_tokens
+                    }
+                }
+                generation.end(endPayload)
+                // Flush to ensure the generation update is sent before the request completes
+                const langfuse: Langfuse = this.handlers['langFuse'].client
+                await langfuse.flushAsync()
             }
         }
 
@@ -1311,50 +1541,54 @@ export class AnalyticHandler {
             const monitor = this.handlers['lunary'].client
 
             if (monitor && llmEventId) {
-                await monitor.trackEvent('llm', 'end', {
+                const eventData: ICommonObject = {
                     runId: llmEventId,
-                    output
-                })
+                    output: outputText
+                }
+                // Add token usage if available
+                if (usageMetadata) {
+                    eventData.tokensUsage = {
+                        prompt: usageMetadata.input_tokens,
+                        completion: usageMetadata.output_tokens
+                    }
+                }
+                if (modelName) {
+                    eventData.model = modelName
+                }
+                await monitor.trackEvent('llm', 'end', eventData)
             }
         }
 
         if (Object.prototype.hasOwnProperty.call(this.handlers, 'langWatch')) {
             const span: LangWatchSpan | undefined = this.handlers['langWatch'].span[returnIds['langWatch'].span]
             if (span) {
-                span.end({
-                    output: autoconvertTypedValues(output)
-                })
+                const endPayload: ICommonObject = {
+                    output: autoconvertTypedValues(outputText)
+                }
+                // Add metrics if usage available
+                if (usageMetadata) {
+                    endPayload.metrics = {
+                        promptTokens: usageMetadata.input_tokens,
+                        completionTokens: usageMetadata.output_tokens
+                    }
+                }
+                if (modelName) {
+                    endPayload.model = modelName
+                }
+                span.end(endPayload)
             }
         }
 
         if (Object.prototype.hasOwnProperty.call(this.handlers, 'arize')) {
-            const llmSpan: Span | undefined = this.handlers['arize'].llmSpan[returnIds['arize'].llmSpan]
-            if (llmSpan) {
-                llmSpan.setAttribute('output.value', JSON.stringify(output))
-                llmSpan.setAttribute('output.mime_type', 'application/json')
-                llmSpan.setStatus({ code: SpanStatusCode.OK })
-                llmSpan.end()
-            }
+            this._endOtelSpan('arize', returnIds, outputText, usageMetadata, modelName)
         }
 
         if (Object.prototype.hasOwnProperty.call(this.handlers, 'phoenix')) {
-            const llmSpan: Span | undefined = this.handlers['phoenix'].llmSpan[returnIds['phoenix'].llmSpan]
-            if (llmSpan) {
-                llmSpan.setAttribute('output.value', JSON.stringify(output))
-                llmSpan.setAttribute('output.mime_type', 'application/json')
-                llmSpan.setStatus({ code: SpanStatusCode.OK })
-                llmSpan.end()
-            }
+            this._endOtelSpan('phoenix', returnIds, outputText, usageMetadata, modelName)
         }
 
         if (Object.prototype.hasOwnProperty.call(this.handlers, 'opik')) {
-            const llmSpan: Span | undefined = this.handlers['opik'].llmSpan[returnIds['opik'].llmSpan]
-            if (llmSpan) {
-                llmSpan.setAttribute('output.value', JSON.stringify(output))
-                llmSpan.setAttribute('output.mime_type', 'application/json')
-                llmSpan.setStatus({ code: SpanStatusCode.OK })
-                llmSpan.end()
-            }
+            this._endOtelSpan('opik', returnIds, outputText, usageMetadata, modelName)
         }
     }
 
@@ -1658,7 +1892,7 @@ export class AnalyticHandler {
         }
 
         if (Object.prototype.hasOwnProperty.call(this.handlers, 'lunary')) {
-            const toolEventId: string = this.handlers['lunary'].llmEvent[returnIds['lunary'].toolEvent]
+            const toolEventId: string = this.handlers['lunary'].toolEvent[returnIds['lunary'].toolEvent]
             const monitor = this.handlers['lunary'].client
 
             if (monitor && toolEventId) {

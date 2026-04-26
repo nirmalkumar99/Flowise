@@ -1,21 +1,26 @@
-import { cloneDeep } from 'lodash'
+import { cloneDeep, omit } from 'lodash'
 import { StatusCodes } from 'http-status-codes'
 import { getRunningExpressApp } from '../../utils/getRunningExpressApp'
-import { INodeData } from '../../Interface'
-import { INodeOptionsValue, ICommonObject, handleEscapeCharacters } from 'flowise-components'
+import { INodeData, MODE } from '../../Interface'
+import { ClientType, INodeOptionsValue } from 'flowise-components'
 import { databaseEntities } from '../../utils'
 import logger from '../../utils/logger'
 import { InternalFlowiseError } from '../../errors/internalFlowiseError'
 import { getErrorMessage } from '../../errors/utils'
+import { OMIT_QUEUE_JOB_DATA } from '../../utils/constants'
+import { executeCustomNodeFunction } from '../../utils/executeCustomNodeFunction'
+import { filterNodeByClient } from './filterNodeByClient'
+
+export { filterNodeByClient }
 
 // Get all component nodes
-const getAllNodes = async () => {
+const getAllNodes = async (client?: ClientType) => {
     try {
         const appServer = getRunningExpressApp()
         const dbResponse = []
         for (const nodeName in appServer.nodesPool.componentNodes) {
             const clonedNode = cloneDeep(appServer.nodesPool.componentNodes[nodeName])
-            dbResponse.push(clonedNode)
+            dbResponse.push(filterNodeByClient(clonedNode, client))
         }
         return dbResponse
     } catch (error) {
@@ -24,7 +29,7 @@ const getAllNodes = async () => {
 }
 
 // Get all component nodes for a specific category
-const getAllNodesForCategory = async (category: string) => {
+const getAllNodesForCategory = async (category: string, client?: ClientType) => {
     try {
         const appServer = getRunningExpressApp()
         const dbResponse = []
@@ -32,7 +37,7 @@ const getAllNodesForCategory = async (category: string) => {
             const componentNode = appServer.nodesPool.componentNodes[nodeName]
             if (componentNode.category === category) {
                 const clonedNode = cloneDeep(componentNode)
-                dbResponse.push(clonedNode)
+                dbResponse.push(filterNodeByClient(clonedNode, client))
             }
         }
         return dbResponse
@@ -45,12 +50,12 @@ const getAllNodesForCategory = async (category: string) => {
 }
 
 // Get specific component node via name
-const getNodeByName = async (nodeName: string) => {
+const getNodeByName = async (nodeName: string, client?: ClientType) => {
     try {
         const appServer = getRunningExpressApp()
         if (Object.prototype.hasOwnProperty.call(appServer.nodesPool.componentNodes, nodeName)) {
-            const dbResponse = appServer.nodesPool.componentNodes[nodeName]
-            return dbResponse
+            const clonedNode = cloneDeep(appServer.nodesPool.componentNodes[nodeName])
+            return filterNodeByClient(clonedNode, client)
         } else {
             throw new InternalFlowiseError(StatusCodes.NOT_FOUND, `Node ${nodeName} not found`)
         }
@@ -97,7 +102,12 @@ const getSingleNodeAsyncOptions = async (nodeName: string, requestBody: any): Pr
 
                 const dbResponse: INodeOptionsValue[] = await nodeInstance.loadMethods![methodName]!.call(nodeInstance, nodeData, {
                     appDataSource: appServer.AppDataSource,
-                    databaseEntities: databaseEntities
+                    databaseEntities: databaseEntities,
+                    componentNodes: appServer.nodesPool.componentNodes,
+                    previousNodes: requestBody.previousNodes,
+                    currentNode: requestBody.currentNode,
+                    searchOptions: requestBody.searchOptions,
+                    cachePool: appServer.cachePool
                 })
 
                 return dbResponse
@@ -116,48 +126,32 @@ const getSingleNodeAsyncOptions = async (nodeName: string, requestBody: any): Pr
 }
 
 // execute custom function node
-const executeCustomFunction = async (requestBody: any) => {
-    try {
-        const appServer = getRunningExpressApp()
-        const body = requestBody
-        const functionInputVariables = Object.fromEntries(
-            [...(body?.javascriptFunction ?? '').matchAll(/\$([a-zA-Z0-9_]+)/g)].map((g) => [g[1], undefined])
-        )
-        if (functionInputVariables && Object.keys(functionInputVariables).length) {
-            for (const key in functionInputVariables) {
-                if (key.includes('vars')) {
-                    delete functionInputVariables[key]
-                }
-            }
+const executeCustomFunction = async (requestBody: any, workspaceId?: string, orgId?: string) => {
+    const appServer = getRunningExpressApp()
+    const executeData = {
+        appDataSource: appServer.AppDataSource,
+        componentNodes: appServer.nodesPool.componentNodes,
+        data: requestBody,
+        isExecuteCustomFunction: true,
+        orgId,
+        workspaceId
+    }
+
+    if (process.env.MODE === MODE.QUEUE) {
+        const predictionQueue = appServer.queueManager.getQueue('prediction')
+
+        const job = await predictionQueue.addJob(omit(executeData, OMIT_QUEUE_JOB_DATA))
+        logger.debug(`[server]: Execute Custom Function Job added to queue by ${orgId}: ${job.id}`)
+
+        const queueEvents = predictionQueue.getQueueEvents()
+        const result = await job.waitUntilFinished(queueEvents)
+        if (!result) {
+            throw new Error('Failed to execute custom function')
         }
-        const nodeData = { inputs: { functionInputVariables, ...body } }
-        if (Object.prototype.hasOwnProperty.call(appServer.nodesPool.componentNodes, 'customFunction')) {
-            try {
-                const nodeInstanceFilePath = appServer.nodesPool.componentNodes['customFunction'].filePath as string
-                const nodeModule = await import(nodeInstanceFilePath)
-                const newNodeInstance = new nodeModule.nodeClass()
 
-                const options: ICommonObject = {
-                    appDataSource: appServer.AppDataSource,
-                    databaseEntities,
-                    logger
-                }
-
-                const returnData = await newNodeInstance.init(nodeData, '', options)
-                const dbResponse = typeof returnData === 'string' ? handleEscapeCharacters(returnData, true) : returnData
-
-                return dbResponse
-            } catch (error) {
-                throw new InternalFlowiseError(StatusCodes.INTERNAL_SERVER_ERROR, `Error running custom function: ${error}`)
-            }
-        } else {
-            throw new InternalFlowiseError(StatusCodes.NOT_FOUND, `Node customFunction not found`)
-        }
-    } catch (error) {
-        throw new InternalFlowiseError(
-            StatusCodes.INTERNAL_SERVER_ERROR,
-            `Error: nodesService.executeCustomFunction - ${getErrorMessage(error)}`
-        )
+        return result
+    } else {
+        return await executeCustomNodeFunction(executeData)
     }
 }
 

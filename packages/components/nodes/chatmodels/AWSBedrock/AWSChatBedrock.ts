@@ -1,13 +1,11 @@
 import { BaseCache } from '@langchain/core/caches'
 import { ICommonObject, IMultiModalOption, INode, INodeData, INodeOptionsValue, INodeParams } from '../../../src/Interface'
-import { getBaseClasses, getCredentialData, getCredentialParam } from '../../../src/utils'
+import { getBaseClasses } from '../../../src/utils'
 import { getModels, getRegions, MODEL_TYPE } from '../../../src/modelLoader'
+import { getAWSCredentialConfig } from '../../../src/awsToolsUtils'
 import { ChatBedrockConverseInput, ChatBedrockConverse } from '@langchain/aws'
 import { BedrockChat } from './FlowiseAWSChatBedrock'
 
-/**
- * @author Michael Connor <mlconnor@yahoo.com>
- */
 class AWSChatBedrock_ChatModels implements INode {
     label: string
     name: string
@@ -21,9 +19,9 @@ class AWSChatBedrock_ChatModels implements INode {
     inputs: INodeParams[]
 
     constructor() {
-        this.label = 'AWS ChatBedrock'
+        this.label = 'AWS Bedrock'
         this.name = 'awsChatBedrock'
-        this.version = 6.0
+        this.version = 6.1
         this.type = 'AWSChatBedrock'
         this.icon = 'aws.svg'
         this.category = 'Chat Models'
@@ -65,12 +63,28 @@ class AWSChatBedrock_ChatModels implements INode {
                 optional: true
             },
             {
+                label: 'Custom Endpoint Host',
+                name: 'endpointHost',
+                type: 'string',
+                description: 'Custom endpoint host to use for the model. If provided, will override the default endpoint host.',
+                optional: true
+            },
+            {
                 label: 'Streaming',
                 name: 'streaming',
                 type: 'boolean',
                 default: true,
                 optional: true,
                 additionalParams: true
+            },
+            {
+                label: 'Allow Image Uploads',
+                name: 'allowImageUploads',
+                type: 'boolean',
+                description:
+                    'Allow image input. Refer to the <a href="https://docs.flowiseai.com/using-flowise/uploads#image" target="_blank">docs</a> for more details.',
+                default: false,
+                optional: true
             },
             {
                 label: 'Temperature',
@@ -93,13 +107,14 @@ class AWSChatBedrock_ChatModels implements INode {
                 default: 200
             },
             {
-                label: 'Allow Image Uploads',
-                name: 'allowImageUploads',
+                label: 'Latency Optimized',
+                name: 'latencyOptimized',
                 type: 'boolean',
                 description:
-                    'Allow image input. Refer to the <a href="https://docs.flowiseai.com/using-flowise/uploads#image" target="_blank">docs</a> for more details.',
+                    'Enable latency optimized configuration for supported models. Refer to the supported <a href="https://docs.aws.amazon.com/bedrock/latest/userguide/latency-optimized-inference.html" target="_blank">latecny optimized models</a> for more details.',
                 default: false,
-                optional: true
+                optional: true,
+                additionalParams: true
             }
         ]
     }
@@ -122,6 +137,8 @@ class AWSChatBedrock_ChatModels implements INode {
         const iMax_tokens_to_sample = nodeData.inputs?.max_tokens_to_sample as string
         const cache = nodeData.inputs?.cache as BaseCache
         const streaming = nodeData.inputs?.streaming as boolean
+        const latencyOptimized = nodeData.inputs?.latencyOptimized as boolean
+        const endpointHost = (nodeData.inputs?.endpointHost as string)?.trim()
 
         const obj: ChatBedrockConverseInput = {
             region: iRegion,
@@ -131,24 +148,25 @@ class AWSChatBedrock_ChatModels implements INode {
             streaming: streaming ?? true
         }
 
+        if (latencyOptimized) {
+            obj.performanceConfig = { latency: 'optimized' }
+        }
+
+        if (endpointHost) {
+            obj.endpointHost = endpointHost
+        }
+
         /**
          * Long-term credentials specified in LLM configuration are optional.
          * Bedrock's credential provider falls back to the AWS SDK to fetch
          * credentials from the running environment.
          * When specified, we override the default provider with configured values.
+         * Supports STS AssumeRole when a Role ARN is configured in the credential.
          * @see https://github.com/aws/aws-sdk-js-v3/blob/main/packages/credential-provider-node/README.md
          */
-        const credentialData = await getCredentialData(nodeData.credential ?? '', options)
-        if (credentialData && Object.keys(credentialData).length !== 0) {
-            const credentialApiKey = getCredentialParam('awsKey', credentialData, nodeData)
-            const credentialApiSecret = getCredentialParam('awsSecret', credentialData, nodeData)
-            const credentialApiSession = getCredentialParam('awsSession', credentialData, nodeData)
-
-            obj.credentials = {
-                accessKeyId: credentialApiKey,
-                secretAccessKey: credentialApiSecret,
-                sessionToken: credentialApiSession
-            }
+        const credentialConfig = await getAWSCredentialConfig(nodeData, options, iRegion)
+        if (credentialConfig.credentials) {
+            obj.credentials = credentialConfig.credentials
         }
         if (cache) obj.cache = cache
 
