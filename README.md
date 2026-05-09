@@ -81,6 +81,27 @@ Download and Install [NodeJS](https://nodejs.org/en/download) >= 18.15.0
     docker stop flowise
     ```
 
+4. # On your local machine — build and push to Docker Hub
+    ```bash
+    cd C:\develop\project\flowise-26APR\Flowise
+    ```
+5. # Login to Docker Hub
+
+    docker login
+    nirmalkumar99@yahoo.com/xxxxxxxxx
+
+6. # Build image
+
+    docker build -t yourdockerhubusername/flowise .
+
+7. # Push to Docker Hub
+    docker push nirmalkumar/flowise
+
+# on EC2
+
+8. # docker pull yourdockerhubusername/flowise
+    docker run -d -p 3000:3000 --name flowise --restart always nirmalkumar/flowise
+
 ## 👨‍💻 Developers
 
 Flowise has 3 different modules in a single mono repository.

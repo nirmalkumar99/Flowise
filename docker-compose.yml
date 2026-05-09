@@ -1,0 +1,30 @@
+version: '3.8'
+services:
+    nginx-proxy-manager:
+        image: jc21/nginx-proxy-manager:latest
+        container_name: nginx-proxy-manager
+        restart: always
+        ports:
+            - '80:80'
+            - '443:443'
+            - '81:81' # Admin UI
+        volumes:
+            - npm_data:/data
+            - npm_letsencrypt:/etc/letsencrypt
+    flowise:
+        image: flowiseai/flowise
+        container_name: flowise
+        restart: always
+        ports:
+            - '3000:3000'
+        volumes:
+            - flowise_data:/root/.flowise
+        environment:
+            - PORT=3000
+            - FLOWISE_USERNAME=nirmalkumar99@yahoo.com
+            - FLOWISE_PASSWORD=Password12#
+
+volumes:
+    npm_data:
+    npm_letsencrypt:
+    flowise_data:
